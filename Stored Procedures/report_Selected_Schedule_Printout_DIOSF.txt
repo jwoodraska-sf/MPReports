@@ -1,0 +1,112 @@
+USE [MinistryPlatform]
+GO
+
+/****** Object:  StoredProcedure [dbo].[report_Selected_Schedule_Printout_DIOSF]    Script Date: 3/31/2026 1:10:10 PM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+/******************************************************************************/
+/*	VERSION		DESCRIPTION																											*/
+/*	1.00		RRN-1120 Need to create a new report for Volunteer Connect															*/	
+/*	1.01		Added Sort_Order field and sorting parameter - CORRECTED VERSION												*/
+/*																																	*/
+/******************************************************************************/
+
+CREATE PROCEDURE [dbo].[report_Selected_Schedule_Printout_DIOSF]
+	@DomainID uniqueidentifier
+	,@UserID uniqueidentifier
+	,@PageID Int 
+	,@SelectionID Int
+	,@SortByOrder BIT = 1  -- 1 = Sort by Sort_Order, 0 = Sort Alphabetically
+AS
+BEGIN
+	-- Handle Time Zones 
+	DECLARE @UserOffset as int
+	DECLARE @UserTimeZone nvarchar(64)
+	DECLARE @UserCurrentTime datetime 
+	SELECT @UserOffset = User_Time_Offset, @UserTimeZone = Time_Zone, @UserCurrentTime= Current_User_Time FROM vw_mp_User_Facts WHERE User_GUID = @UserID
+
+	-- Get a list of Schedule_IDs from the selection
+	CREATE TABLE #Schedules (Schedule_ID Int)
+	INSERT INTO #Schedules
+	SELECT Record_ID 
+	FROM dp_Selected_Records SR 
+	INNER JOIN dp_Selections S ON S.Selection_ID = SR.Selection_ID  
+	INNER JOIN dbo.dp_Users U ON U.[User_ID] = S.[User_ID] AND U.User_GUID = @UserID 
+	WHERE S.Page_ID = @PageID AND ((S.Selection_ID = @SelectionID AND @SelectionID > 0) OR (S.Selection_Name = 'dp_DEFAULT' AND @SelectionID < 1 AND S.Sub_Page_ID IS NULL))
+
+	CREATE INDEX IX_Schedules_Schedule_ID ON #Schedules(Schedule_ID)
+
+	-- Determine count of Awaiting/Accepted volunteers per Schedule_Role_ID in a temp table
+	CREATE TABLE #VolunteerCount (Schedule_Role_ID Int, Volunteer_Count Int)
+	INSERT INTO #VolunteerCount (Schedule_Role_ID, Volunteer_Count)
+	SELECT SP.Schedule_Role_ID,
+		   COUNT(SP.Participant_ID) AS Volunteer_Count
+	FROM Scheduled_Participants SP
+	INNER JOIN Schedule_Roles SR ON SP.Schedule_Role_ID = SR.Schedule_Role_ID
+	WHERE ISNULL(Accepted, 1) = 1
+		  AND EXISTS (SELECT 1 FROM #Schedules WHERE #Schedules.Schedule_ID = SR.Schedule_ID)
+	GROUP BY SP.Schedule_Role_ID
+
+	CREATE INDEX IX_VolunteerCount_Schedule_Role_ID ON #VolunteerCount(Schedule_Role_ID)
+
+	-- Final Result Set with sortable datetime fields and Sort_Order
+	SELECT S.Schedule_ID,
+		   SR.Schedule_Role_ID, 
+		   G.Group_Name,
+		   FORMAT(DATEADD(hh,@UserOffset,E.Event_Start_Date), 'MMMM dd, yyyy') AS Event_Start_Date,
+		   DATEADD(hh,@UserOffset,E.Event_Start_Date) AS Event_Start_Date_Sort,
+		    CASE 
+		       WHEN DATEPART(WEEKDAY, DATEADD(hh,@UserOffset,E.Event_Start_Date)) = 7 THEN Cast(DATEADD(hh,@UserOffset,E.Event_Start_Date) as Date) -- Saturday
+		       WHEN DATEPART(WEEKDAY, DATEADD(hh,@UserOffset,E.Event_Start_Date)) = 1 THEN Cast(DATEADD(DAY, -1, DATEADD(hh,@UserOffset,E.Event_Start_Date)) as Date) -- Sunday, go back to Saturday
+		       ELSE Cast(DATEADD(hh,@UserOffset,E.Event_Start_Date) as Date) -- Other days
+		   END AS Weekend_Group,
+		   S.Schedule_Name,
+		   ISNULL(SR.Role_Label, GR.Role_Title) AS Volunteer_Role,
+		   RIGHT(CONVERT(VARCHAR, SR.Start_Time, 100), 7) AS Start_Time,
+		   SR.Start_Time AS Start_Time_Sort,
+		   RIGHT(CONVERT(VARCHAR, SR.End_Time, 100), 7) AS End_Time,
+		   CONCAT(ISNULL(C.Nickname, ''),' ', ISNULL(C.Last_Name, '')) AS Volunteer_Name,
+		   CONCAT(ISNULL(C.Last_Name, ''),', ', ISNULL(C.Nickname, '')) AS Volunteer_ByLastName,
+		   CASE WHEN SP.Accepted IS NULL THEN 'Awaiting' ELSE 'Accepted' END AS Participant_Status,
+		   C.Mobile_Phone,
+		   SR.Number_Of_Volunteers - ISNULL(VC.Volunteer_Count, 0) AS Unfilled_Roles,
+		   SR.Sort_Order,
+		   -- Sort_Order_Priority: NULL values become 999999 and sort last
+		   CASE 
+			   WHEN SR.Sort_Order IS NULL THEN 999999 
+			   ELSE SR.Sort_Order 
+		   END AS Sort_Order_Priority,
+		   -- Role_Alpha_Sort: For alphabetical sorting
+		   ISNULL(SR.Role_Label, GR.Role_Title) AS Role_Alpha_Sort,
+		   cong.Congregation_Name
+	FROM Schedules S
+	INNER JOIN #Schedules SS ON S.Schedule_ID = SS.Schedule_ID
+	INNER JOIN Events E ON S.Event_ID = E.Event_ID
+	INNER JOIN Groups G ON S.Group_ID = G.Group_ID
+	INNER JOIN Congregations Cong on cong.Congregation_ID=g.Congregation_ID
+	INNER JOIN Schedule_Roles SR ON S.Schedule_ID = SR.Schedule_ID
+	INNER JOIN Group_Roles GR ON SR.Group_Role_ID = GR.Group_Role_ID
+	LEFT JOIN Scheduled_Participants SP ON SR.Schedule_Role_ID = SP.Schedule_Role_ID
+	LEFT JOIN Contacts C ON SP.Participant_ID = C.Participant_Record
+	INNER JOIN dp_Domains Dom ON S.Domain_ID = Dom.Domain_ID
+	LEFT JOIN #VolunteerCount VC ON SR.Schedule_Role_ID = VC.Schedule_Role_ID
+	WHERE ISNULL(SP.Accepted, 1) = 1 AND Dom.Domain_GUID = @DomainID
+	ORDER BY 
+		Weekend_Group,
+		CASE WHEN @SortByOrder = 1 THEN 
+			CASE WHEN SR.Sort_Order IS NULL THEN 999999 ELSE SR.Sort_Order END 
+		ELSE 999999 END,
+		CASE WHEN @SortByOrder = 0 THEN ISNULL(SR.Role_Label, GR.Role_Title) ELSE '' END,
+		G.Group_Name
+
+	DROP TABLE #Schedules
+	DROP TABLE #VolunteerCount
+END
+GO
+
+
